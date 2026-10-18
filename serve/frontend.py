@@ -839,6 +839,35 @@ def json_tool_call(body: str, schemas: dict) -> ToolCall | None:
     return ToolCall(name=obj["name"], arguments=args) if isinstance(args, dict) else None
 
 
+def clean_tool_name(name, schemas=None):
+    """2-bit models append garbage to tool names (e.g. 'Bash<parkee_label', 'Read(', 'mcp<context-mode');
+    strip the trailing junk and map corrupted mcp names back to a real mcp tool."""
+    if not isinstance(name, str):
+        return name
+    name = name.split("<", 1)[0].split("(", 1)[0].strip()
+    if schemas is not None and name not in schemas and name.startswith("mcp"):
+        for k in schemas:
+            if k.startswith("mcp") and k.endswith("ctx_search"):
+                return k
+    return name
+
+
+def sanitize_args(args, schema=None):
+    """The model emits garbage tool arguments; drop keys not in the tool's schema, add missing required
+    fields (empty), and non-dict -> {}."""
+    if not isinstance(args, dict):
+        return {}
+    params = (schema or {}).get("parameters") or {} if isinstance(schema, dict) else {}
+    props = params.get("properties") or {}
+    if not props:
+        return args
+    args = {k: v for k, v in args.items() if k in props}
+    for req in params.get("required") or []:
+        if req not in args:
+            args[req] = "" if (props.get(req, {}) or {}).get("type") == "string" else None
+    return args
+
+
 def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     """`<function=NAME>\\n<parameter=P>\\nVALUE\\n</parameter>...</function>` -> ToolCall. Values are JSON-decoded
     when the tool's schema says the parameter is not a string (or, without a schema, when they parse as JSON
@@ -846,7 +875,7 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     body = body.strip()
     if not body.startswith("<function=") or ">" not in body:
         raise ValueError("malformed tool call: " + body[:80])
-    name = body[len("<function="):body.index(">")].strip()      # `<function= capture>`: the model's stray space
+    name = clean_tool_name(body[len("<function="):body.index(">")].strip())      # `<function= capture>`: the model's stray space
     rest = body[body.index(">") + 1:]
     props = ((schema or {}).get("parameters") or {}).get("properties") or {}
     args = {}
@@ -869,7 +898,7 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
                 args[pname] = json.loads(value)
             except ValueError:
                 args[pname] = value
-    return ToolCall(name=name, arguments=args)
+    return ToolCall(name=name, arguments=sanitize_args(args, schema))
 
 
 RCALL_MAX = 32768        # the most of a `<tool_call>` inside the reasoning that is held while waiting for its end (#804)
@@ -1080,7 +1109,7 @@ class OutputParser:
                 b = rest.find(">", a + 10) if a >= 0 else -1
                 if b < 0:
                     return out
-                name = rest[a + 10:b]
+                name = clean_tool_name(rest[a + 10:b], self.schemas)
                 self.scall = ToolCall(name=name, arguments={})
                 props = ((self.schemas.get(name) or {}).get("parameters") or {}).get("properties") or {}
                 self.sdeclared = {k: (v or {}).get("type") for k, v in props.items()}

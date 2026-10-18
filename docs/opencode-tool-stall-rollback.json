@@ -1,0 +1,9 @@
+{
+  "target": "C:/Users/Administrator/.config/opencode/opencode.json",
+  "captured": "2026-10-17",
+  "restore_keys": {
+    "instructions": ["~/.opencode/skills/karpathy-guidelines/SKILL.md", "使用中文交流和沟通"]
+  },
+  "remove_added_keys": ["tool_output", "compaction", "agent"],
+  "note": "Only these keys are changed by this fix. Leave providers, credentials, model, small_model and plugins unchanged. If these keys were subsequently edited, merge manually rather than blindly restoring."
+}

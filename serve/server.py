@@ -240,6 +240,33 @@ PP_SLACK = 3.0
 # STRATA_ENGINE_READY_S / STRATA_VISION_READY_S / STRATA_VISION_ENCODE_S override them (0 = wait for ever, as before).
 
 
+def context_overflow_message(prompt_tokens: int, context: int, max_new: int | None) -> str:
+    """Exact accounting plus phrases Claude clients use for compact/rebudget recovery."""
+    requested = max_new if max_new is not None and max_new > 0 else None
+    output = requested if requested is not None else 1
+    room = max(0, context - CTX_SLACK - prompt_tokens)
+    required = prompt_tokens + output + CTX_SLACK
+    excess = max(0, required - context)
+    if room < 1:
+        # Compare the actual prompt to the usable input limit, not the raw window.
+        prefix = (f"prompt is too long: {prompt_tokens} tokens > {context - CTX_SLACK - 1} maximum input tokens "
+                  f"with 1 output token and {CTX_SLACK} safety tokens reserved. ")
+        action = ("The prompt leaves no room to answer. Compact conversation history or reduce input before retrying; "
+                  "repeating the same input will fail.")
+    else:
+        prefix = "input length and `max_tokens` exceed context limit: "
+        action = f"Retry with max_tokens <= {room}, or compact history to keep the requested output budget."
+    return (prefix + f"request exceeds the context window: prompt ({prompt_tokens} tokens) "
+            + (f"+ max tokens ({requested}) " if requested is not None else "leaves no room to answer ")
+            + f"in the context ({context}); input_tokens={prompt_tokens}, "
+            + f"requested_output_tokens={requested if requested is not None else 'auto'}, "
+            + f"required_output_tokens={output}, safety_tokens={CTX_SLACK}, "
+            + f"required_total_tokens={required}, context_limit_tokens={context}, excess_tokens={excess}, "
+            + f"available_output_tokens={room}. {action} requests are never truncated. "
+            + f"Send a smaller max_tokens (at most {room} here); "
+            + '"fit_max_tokens": true can shorten output only when input leaves room.')
+
+
 def _timeout_env(name: str, default: float) -> float | None:
     try:
         v = float(os.environ.get(name, default))
@@ -4025,18 +4052,12 @@ class Service:
                 # A prompt refused for the context is not kept (#567): the client cannot resend it unchanged.  The
                 # other refusals (engine starting, images) keep it: the same prompt comes back and its encode is reused.
                 self.forget_prompt(encoded_ids)
-                raise ValueError("request exceeds the context window: "
-                                 f"prompt ({len(ids)} tokens) leaves no room to answer in the context "
-                                 f"({ctx}); requests are never truncated")
+                raise ValueError(context_overflow_message(len(ids), ctx, max_new))
             max_new = room
         elif max_new > room:
             if not self.fit_max_tokens:
                 self.forget_prompt(encoded_ids)
-                raise ValueError("request exceeds the context window: "
-                                 f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
-                                 f"({ctx}); requests are never truncated. Send a smaller "
-                                 f"max_tokens (at most {max(0, room)} here), or add \"fit_max_tokens\": true to the "
-                                 "model's strata-<model>.json to shorten it to the room left (#545)")
+                raise ValueError(context_overflow_message(len(ids), ctx, max_new))
             max_new = max(1, room)          # --fit-max-tokens: a shorter completion beats a 400
         if images:
             # The request's images in one file for GENI (~10 MB a picture), written once nothing above refuses the
@@ -4213,7 +4234,7 @@ class Service:
                 print(f"[strata] thinking capped at {max_new - reserve} of max_tokens {max_new} to leave room for "
                       f"the answer (budget {budget})", flush=True)
                 budget = max(1, max_new - reserve)
-        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery)
+        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=False, recover=self.tool_call_recovery)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
@@ -6171,6 +6192,14 @@ def make_handler(svc: Service):
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw, store=False))})
 
         def _anthropic(self, req):
+            # Hosted Anthropic search is not a client-executed function tool. Pretending
+            # to support it can make Claude's WebSearch display an empty result as success.
+            for tool in req.get("tools") or []:
+                if isinstance(tool, dict) and isinstance(tool.get("type"), str) and \
+                        tool["type"].startswith("web_search_"):
+                    raise ValueError("Strata does not provide Anthropic hosted web search "
+                                     f"({tool['type']}). No web search was performed. "
+                                     "Use a configured search MCP/CLI provider; fetching a URL is not a search.")
             svc.load()
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)

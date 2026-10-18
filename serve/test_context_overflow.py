@@ -75,6 +75,15 @@ class ContextOverflow(unittest.TestCase):
                         self.assertIn(detail, message)
                         self.assertIn(f"({CTX})", message)
                         self.assertIn("requests are never truncated", message)
+                        required_output = budget if budget is not None and budget > 0 else 1
+                        self.assertIn(f"input_tokens={prompt},", message)
+                        self.assertIn(f"required_total_tokens={prompt + required_output + CTX_SLACK},", message)
+                        self.assertIn(f"excess_tokens={prompt + required_output + CTX_SLACK - CTX},", message)
+                        if prompt + CTX_SLACK >= CTX:
+                            self.assertTrue(message.startswith("prompt is too long:"), message)
+                            self.assertIn(f"{prompt} tokens > {CTX - CTX_SLACK - 1}", message)
+                        else:
+                            self.assertTrue(message.startswith("input length and `max_tokens` exceed context limit:"), message)
                         if "+ max tokens" in detail:
                             room = max(0, CTX - CTX_SLACK - prompt)
                             self.assertIn(f"max_tokens (at most {room} here)", message)
@@ -95,6 +104,26 @@ class ContextOverflow(unittest.TestCase):
                     status, _, body = self.post(path, key, CTX - CTX_SLACK, 1)
                     self.assertEqual(status, 400, body)
                     self.assertIn("exceeds the context window", body["error"]["message"])
+
+    def test_rebudget_or_compact_retry_succeeds(self):
+        for path, key in APIS:
+            with self.subTest(path=path):
+                status, _, body = self.post(path, key, 1024, CTX)
+                self.assertEqual(status, 400)
+                room = CTX - CTX_SLACK - 1024
+                self.assertIn(f"available_output_tokens={room}", body["error"]["message"])
+                status, _, body = self.post(path, key, 1024, room)
+                self.assertEqual(status, 200, body)
+                status, _, body = self.post(path, key, CTX + 100, 16)
+                self.assertEqual(status, 400)
+                self.assertTrue(body["error"]["message"].startswith("prompt is too long:"))
+                status, _, body = self.post(path, key, 1024, 16)
+                self.assertEqual(status, 200, body)
+
+    def test_non_context_errors_are_not_relabeled(self):
+        with mock.patch.object(self.svc, "encode_prompt", side_effect=ValueError("bad tool schema")):
+            with self.assertRaisesRegex(ValueError, "^bad tool schema$"):
+                self.svc.prepare([], None, {}, 16)
 
     def test_prepare_preserves_prompt_and_budget_limits(self):
         ids = [ord("x")] * 1024

@@ -1,0 +1,101 @@
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -237,6 +237,33 @@
+ # load, a slow disk or a slow CPU encode is not a hang.  Only a process that says nothing at all for this long is
+ # ended; the next request starts it again.
+ # STRATA_ENGINE_READY_S / STRATA_VISION_READY_S / STRATA_VISION_ENCODE_S override them (0 = wait for ever, as before).
++
++
++def context_overflow_message(prompt_tokens: int, context: int, max_new: int | None) -> str:
++    """Exact accounting plus phrases Claude clients use for compact/rebudget recovery."""
++    requested = max_new if max_new is not None and max_new > 0 else None
++    output = requested if requested is not None else 1
++    room = max(0, context - CTX_SLACK - prompt_tokens)
++    required = prompt_tokens + output + CTX_SLACK
++    excess = max(0, required - context)
++    if room < 1:
++        # Compare the actual prompt to the usable input limit, not the raw window.
++        prefix = (f"prompt is too long: {prompt_tokens} tokens > {context - CTX_SLACK - 1} maximum input tokens "
++                  f"with 1 output token and {CTX_SLACK} safety tokens reserved. ")
++        action = ("The prompt leaves no room to answer. Compact conversation history or reduce input before retrying; "
++                  "repeating the same input will fail.")
++    else:
++        prefix = "input length and `max_tokens` exceed context limit: "
++        action = f"Retry with max_tokens <= {room}, or compact history to keep the requested output budget."
++    return (prefix + f"request exceeds the context window: prompt ({prompt_tokens} tokens) "
++            + (f"+ max tokens ({requested}) " if requested is not None else "leaves no room to answer ")
++            + f"in the context ({context}); input_tokens={prompt_tokens}, "
++            + f"requested_output_tokens={requested if requested is not None else 'auto'}, "
++            + f"required_output_tokens={output}, safety_tokens={CTX_SLACK}, "
++            + f"required_total_tokens={required}, context_limit_tokens={context}, excess_tokens={excess}, "
++            + f"available_output_tokens={room}. {action} requests are never truncated. "
++            + f"Send a smaller max_tokens (at most {room} here); "
++            + '"fit_max_tokens": true can shorten output only when input leaves room.')
+ 
+ 
+ def _timeout_env(name: str, default: float) -> float | None:
+@@ -3914,17 +3941,11 @@
+         room = ctx - CTX_SLACK - len(ids)
+         if max_new is None or max_new <= 0 or (self.fit_max_tokens and room < 1):
+             if room < 1:
+-                raise ValueError("request exceeds the context window: "
+-                                 f"prompt ({len(ids)} tokens) leaves no room to answer in the context "
+-                                 f"({ctx}); requests are never truncated")
++                raise ValueError(context_overflow_message(len(ids), ctx, max_new))
+             max_new = room
+         elif max_new > room:
+             if not self.fit_max_tokens:
+-                raise ValueError("request exceeds the context window: "
+-                                 f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
+-                                 f"({ctx}); requests are never truncated. Send a smaller "
+-                                 f"max_tokens (at most {max(0, room)} here), or add \"fit_max_tokens\": true to the "
+-                                 "model's strata-<model>.json to shorten it to the room left (#545)")
++                raise ValueError(context_overflow_message(len(ids), ctx, max_new))
+             max_new = max(1, room)          # --fit-max-tokens: a shorter completion beats a 400
+         if images:
+             # The request's images in one file for GENI (~10 MB a picture), written once nothing above refuses the
+--- a/serve/test_context_overflow.py
++++ b/serve/test_context_overflow.py
+@@ -75,6 +75,15 @@
+                         self.assertIn(detail, message)
+                         self.assertIn(f"({CTX})", message)
+                         self.assertIn("requests are never truncated", message)
++                        required_output = budget if budget is not None and budget > 0 else 1
++                        self.assertIn(f"input_tokens={prompt},", message)
++                        self.assertIn(f"required_total_tokens={prompt + required_output + CTX_SLACK},", message)
++                        self.assertIn(f"excess_tokens={prompt + required_output + CTX_SLACK - CTX},", message)
++                        if prompt + CTX_SLACK >= CTX:
++                            self.assertTrue(message.startswith("prompt is too long:"), message)
++                            self.assertIn(f"{prompt} tokens > {CTX - CTX_SLACK - 1}", message)
++                        else:
++                            self.assertTrue(message.startswith("input length and `max_tokens` exceed context limit:"), message)
+                         if "+ max tokens" in detail:
+                             room = max(0, CTX - CTX_SLACK - prompt)
+                             self.assertIn(f"max_tokens (at most {room} here)", message)
+@@ -96,6 +105,26 @@
+                     self.assertEqual(status, 400, body)
+                     self.assertIn("exceeds the context window", body["error"]["message"])
+ 
++    def test_rebudget_or_compact_retry_succeeds(self):
++        for path, key in APIS:
++            with self.subTest(path=path):
++                status, _, body = self.post(path, key, 1024, CTX)
++                self.assertEqual(status, 400)
++                room = CTX - CTX_SLACK - 1024
++                self.assertIn(f"available_output_tokens={room}", body["error"]["message"])
++                status, _, body = self.post(path, key, 1024, room)
++                self.assertEqual(status, 200, body)
++                status, _, body = self.post(path, key, CTX + 100, 16)
++                self.assertEqual(status, 400)
++                self.assertTrue(body["error"]["message"].startswith("prompt is too long:"))
++                status, _, body = self.post(path, key, 1024, 16)
++                self.assertEqual(status, 200, body)
++
++    def test_non_context_errors_are_not_relabeled(self):
++        with mock.patch.object(self.svc, "encode_prompt", side_effect=ValueError("bad tool schema")):
++            with self.assertRaisesRegex(ValueError, "^bad tool schema$"):
++                self.svc.prepare([], None, {}, 16)
++
+     def test_prepare_preserves_prompt_and_budget_limits(self):
+         ids = [ord("x")] * 1024
+         room = CTX - CTX_SLACK - len(ids)
