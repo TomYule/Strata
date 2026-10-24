@@ -1,6 +1,8 @@
 @echo off
 rem Local model menu. Other command-line options are passed to setup.py unchanged.
 setlocal EnableExtensions DisableDelayedExpansion
+rem Python reads and writes text as UTF-8, including non-ASCII folder and user names (#3202).
+set "PYTHONUTF8=1"
 title Strata
 cd /d "%~dp0"
 if errorlevel 1 exit /b 1
@@ -98,7 +100,7 @@ echo  This needs extra disk space; missing support files may be downloaded.
 echo  Large models may run slower when experts must be read from SSD.
 call :ensure_python
 if errorlevel 1 goto failed
-".venv\Scripts\python.exe" setup.py --setup --yes --family "%FAMILY%" --model "%QUANT%" --gguf-dir "%GGUF_DIR%" --data-dir "%~dp0..\Strata-data" --cuda 12 --low-ram auto --context 131072 --vision no --port 8080 --no-start
+"%LOCAL_PYTHON%" setup.py --setup --yes --family "%FAMILY%" --model "%QUANT%" --gguf-dir "%GGUF_DIR%" --data-dir "%~dp0..\Strata-data" --cuda 12 --low-ram auto --context 131072 --vision no --port 8080 --no-start
 if errorlevel 1 goto failed
 if "%MODE%"=="setup" (
     echo  Setup finished. Use START-HERE.bat to start the model.
@@ -121,14 +123,14 @@ if "%MODE%"=="setup" (
 :serve
 call :ensure_python
 if errorlevel 1 goto failed
-".venv\Scripts\python.exe" -m serve.server --engine strata --config "strata-%MODEL%.json" --host 127.0.0.1 --port 8080 --open
+"%LOCAL_PYTHON%" -m serve.server --engine strata --config "strata-%MODEL%.json" --host 127.0.0.1 --port 8080 --open
 if errorlevel 1 goto failed
 exit /b 0
 
 :installer
 call :ensure_python
 if errorlevel 1 goto failed
-".venv\Scripts\python.exe" setup.py %*
+"%LOCAL_PYTHON%" setup.py %*
 set "RESULT=%ERRORLEVEL%"
 if not "%RESULT%"=="0" pause
 exit /b %RESULT%
@@ -148,7 +150,11 @@ pause
 exit /b 1
 
 :ensure_python
-if exist ".venv\Scripts\python.exe" exit /b 0
+rem Prefer the bundled runtime when present, without downloading or creating a venv.
+set "LOCAL_PYTHON=python\python.exe"
+if exist "%LOCAL_PYTHON%" goto bundled
+set "LOCAL_PYTHON=.venv\Scripts\python.exe"
+if exist "%LOCAL_PYTHON%" exit /b 0
 call :findpy
 if defined PY goto venv
 echo  Installing Python 3.12 for your user account ...
@@ -172,6 +178,12 @@ if not defined PY (
 if exist ".venv\Scripts\python.exe" exit /b 0
 echo  Could not create the Python environment in .venv
 exit /b 1
+
+:bundled
+set "PYTHONNOUSERSITE=1"
+set "PYTHONHOME="
+set "PYTHONPATH="
+exit /b 0
 
 :findpy
 set "PY="
